@@ -1,0 +1,21 @@
+[project]
+name = "mamba-jax"
+version = "0.0.1"
+description = "Mamba in JAX / Equinox"
+readme = "README.md"
+requires-python ="~=3.9"
+license = {file = "LICENSE"}
+authors = [
+  {name = "Jon Deaton", email = "jonpauldeaton@gmail.com"},
+]
+keywords = ["safari", "jax", "equinox"]
+classifiers = [
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+urls = { repository = "https://github.com/jondeaton/mamba-jax" }
+dependencies = ["jax>=0.4.13", "jaxtyping>=0.2.20", "equinox" ]
+
+[pytest]
+python_paths = "."
