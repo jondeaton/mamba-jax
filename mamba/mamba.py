@@ -17,6 +17,8 @@ import jax.numpy as jnp
 import einops
 import equinox as eqx
 
+import mamba.bidirectional
+
 
 class Mamba(eqx.Module):
     """Top-level mamba module."""
@@ -51,8 +53,8 @@ class Mamba(eqx.Module):
 
     def __call__(self, token_ids: Integer[Array, "l"]) -> Float[Array, "l d"]:
         x = jax.vmap(self.embed)(token_ids)
-        mask = token_ids[:, None] == 0 if self.bidirectional else None
-        x, _ = jax.lax.scan(lambda x, layer: (layer(x, mask), None), x, self.layers)
+        resets = token_ids <= 2  # reset at pad, <cls> or <eos> token.
+        x, _ = jax.lax.scan(lambda x, layer: (layer(x, resets), None), x, self.layers)
         return x @ self.embed.weight.T
 
 
@@ -63,15 +65,18 @@ class ResidualBlock(eqx.Module):
         self.layer = layer
 
     def __call__(
-        self, x: Float[Array, "l d"], mask: Bool[Array, "l"] | None = None
+        self,
+        x: Float[Array, "l d"],
+        *args,
+        **kwargs,
     ) -> Float[Array, "l d"]:
         x_ = jax.vmap(lambda x: x * jax.lax.rsqrt(jnp.mean(x**2) + 1e-6))(x)
-        x_ = self.layer(x_, mask)
+        x_ = self.layer(x_, *args, **kwargs)
         return x + x_
 
 
 class MambaBlock(eqx.Module):
-    conv: eqx.nn.Conv
+    conv: eqx.nn.Conv | mamba.bidirectional.BidirectionalConv
     res_proj: eqx.nn.Linear
     in_proj: eqx.nn.Linear
 
@@ -100,21 +105,23 @@ class MambaBlock(eqx.Module):
         self.in_proj = eqx.nn.Linear(d_model, d_inner, use_bias=False, key=keys[1])
 
         if self.bidirectional:
-            p = conv_kernel_size // 2
-            padding = ((p, p - 1),)
+            self.conv = mamba.bidirectional.BidirectionalConv(
+                dim=d_inner,
+                kernel_size=conv_kernel_size,
+                key=keys[2],
+            )
         else:
-            padding = ((conv_kernel_size - 1, 0),)
-
-        self.conv = eqx.nn.Conv(
-            num_spatial_dims=1,
-            in_channels=d_inner,
-            out_channels=d_inner,
-            kernel_size=conv_kernel_size,
-            padding=padding,
-            groups=d_inner,
-            use_bias=False,
-            key=keys[2],
-        )
+            pad_size = conv_kernel_size - 1
+            self.conv = eqx.nn.Conv(
+                num_spatial_dims=1,
+                in_channels=d_inner,
+                out_channels=d_inner,
+                kernel_size=conv_kernel_size,
+                padding=((pad_size, 0)),
+                groups=d_inner,
+                use_bias=False,
+                key=keys[2],
+            )
 
         self.B_proj = eqx.nn.Linear(d_inner, d_state, use_bias=False, key=keys[3])
         self.C_proj = eqx.nn.Linear(d_inner, d_state, use_bias=False, key=keys[4])
@@ -160,10 +167,10 @@ class MambaBlock(eqx.Module):
         self.out_proj = eqx.nn.Linear(d_inner, d_model, use_bias=False, key=keys[7])
 
     def __call__(
-        self, x: Float[Array, "l d"], mask: Bool[Array, "l"] | None = None
+        self,
+        x: Float[Array, "l d"],
+        resets: Bool[Array, "l"] | None = None,
     ) -> Float[Array, "l d"]:
-        x = jnp.where(mask, 0, x) if mask is not None else x
-
         res = jax.vmap(self.res_proj)(x)
         x = jax.vmap(self.in_proj)(x)
 
@@ -171,14 +178,17 @@ class MambaBlock(eqx.Module):
         assert x.shape == res.shape, (x.shape, res.shape)
         x = jax.nn.silu(x)
 
-        y = self.ssm(x)
+        y = self.ssm(x, resets)
         y *= jax.nn.silu(res)
 
         out = jax.vmap(self.out_proj)(y)
-        out = jnp.where(mask, 0, out) if mask is not None else out
         return out
 
-    def ssm(self, x: Float[Array, "l d_inner"]) -> Float[Array, "l d_inner"]:
+    def ssm(
+        self,
+        x: Float[Array, "l d_inner"],
+        resets: Bool[Array, "l"] | None = None,
+    ) -> Float[Array, "l d_inner"]:
         A = -jnp.exp(self.log_A)
 
         B = jax.vmap(self.B_proj)(x)
@@ -193,8 +203,8 @@ class MambaBlock(eqx.Module):
             dtf, dtb = jnp.split(dt, 2, axis=1)
             Af, Ab = jnp.split(A, 2, axis=0)
             Df, Db = jnp.split(self.D, 2)
-            fwd = selective_scan(xf, dtf, Af, B, C, Df)
-            bwd = selective_scan(xb, dtb, Ab, B, C, Db, reverse=True)
+            fwd = selective_scan(xf, dtf, Af, B, C, Df, resets=resets)
+            bwd = selective_scan(xb, dtb, Ab, B, C, Db, resets=resets, reverse=True)
             return jnp.concatenate([fwd, bwd], axis=1)
 
 
@@ -205,12 +215,21 @@ def selective_scan(
     B: Float[Array, "l n"],
     C: Float[Array, "l n"],
     D: Float[Array, "d_in"],
+    resets: Bool[Array, "l"] | None = None,
     discretization: str = "bilinear",
     reverse: bool = False,
 ) -> Float[Array, "l d_in"]:
-    """Selective Scan Algorithm."""
+    """Selective Scan Algorithm.
+
+    Reset enables
+        1. sequence packing <seq1>!<seq2>
+        2. padding invariance for bidirectional.
+    """
     l, d_in = x.shape
     _, n = A.shape
+
+    if resets is None:
+        resets = jnp.zeros(shape=(l,), dtype=bool)
 
     dt_A = dt[:, :, None] * A[None, :, :]
     dt_B = dt[:, :, None] * B[:, None, :]
@@ -219,10 +238,11 @@ def selective_scan(
         dA = (1 + dt_A / 2) / (1 - dt_A / 2)
         dB = dt_B / (1 - dt_A / 2)
     elif discretization == "zoh":
+        # TODO: review this.
         dA = jnp.exp(dt_A)
         dB = dt_B
     else:
-        raise NotImplementedError
+        raise NotImplementedError()
 
     assert isinstance(dA, Float[Array, f"{l} {d_in} {n}"])
     assert isinstance(dB, Float[Array, f"{l} {d_in} {n}"])
@@ -234,13 +254,21 @@ def selective_scan(
             Float[Array, "d_in n"],  # dA
             Float[Array, "d_in n"],  # dB
             Float[Array, "n"],  # C
+            Bool,  # reset
         ],
     ):
-        xi, dAi, dBi, Ci = params
-        h_: Float[Array, "d_in n"] = dAi * h + dBi * xi[:, None]
-        y: Float[Array, "d_in"] = h @ Ci
+        xi, dAi, dBi, Ci, reset = params
+
+        h_: Float[Array, "d_in n"] = jax.lax.cond(
+            reset,
+            lambda _: jnp.zeros_like(h),
+            lambda _: dAi * h + dBi * xi[:, None],
+            None,
+        )
+        y: Float[Array, "d_in"] = h_ @ Ci
+
         return h_, y
 
-    h0 = jnp.zeros(shape=(d_in, n))
-    _, y = jax.lax.scan(f, h0, (x, dA, dB, C), length=l, reverse=reverse)
+    h0 = jnp.zeros(shape=(d_in, n), dtype=x.dtype)
+    _, y = jax.lax.scan(f, h0, (x, dA, dB, C, resets), reverse=reverse)
     return y + x * D
