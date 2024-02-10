@@ -207,25 +207,22 @@ class MambaBlock(eqx.Module):
             bwd = selective_scan(xb, dtb, Ab, B, C, Db, resets=resets, reverse=True)
             return jnp.concatenate([fwd, bwd], axis=1)
 
-
 def selective_scan(
-    x: Float[Array, "l d_in"],
-    dt: Float[Array, "l d_in"],
-    A: Float[Array, "d_in n"],
+    x: Float[Array, "l d"],
+    dt: Float[Array, "l d"],
+    A: Float[Array, "d n"],
     B: Float[Array, "l n"],
     C: Float[Array, "l n"],
-    D: Float[Array, "d_in"],
+    D: Float[Array, "d"],
     resets: Bool[Array, "l"] | None = None,
-    discretization: str = "bilinear",
+    discretization: str = "zoh",
     reverse: bool = False,
-) -> Float[Array, "l d_in"]:
+) -> Float[Array, "l d"]:
     """Selective Scan Algorithm.
 
-    Reset enables
-        1. sequence packing <seq1>!<seq2>
-        2. padding invariance for bidirectional.
+    TODO: re-write this
     """
-    l, d_in = x.shape
+    l, d = x.shape
     _, n = A.shape
 
     if resets is None:
@@ -238,37 +235,30 @@ def selective_scan(
         dA = (1 + dt_A / 2) / (1 - dt_A / 2)
         dB = dt_B / (1 - dt_A / 2)
     elif discretization == "zoh":
-        # TODO: review this.
         dA = jnp.exp(dt_A)
-        dB = dt_B
+        dB = (dA - 1) * dt_B / dt_A
     else:
-        raise NotImplementedError()
+        raise NotImplementedError
 
-    assert isinstance(dA, Float[Array, f"{l} {d_in} {n}"])
-    assert isinstance(dB, Float[Array, f"{l} {d_in} {n}"])
+    assert isinstance(dA, Float[Array, f"{l} {d} {n}"])
+    assert isinstance(dB, Float[Array, f"{l} {d} {n}"])
 
-    def f(
-        h: Float[Array, "d_in n"],
-        params: tuple[
-            Float[Array, "d_in"],  # x
-            Float[Array, "d_in n"],  # dA
-            Float[Array, "d_in n"],  # dB
-            Float[Array, "n"],  # C
-            Bool,  # reset
-        ],
+    def binop(
+        ei: tuple[Float[Array, "d n"], Float[Array, "d n"]],
+        ej: tuple[Float[Array, "d n"], Float[Array, "d n"]],
     ):
-        xi, dAi, dBi, Ci, reset = params
+        """
+        See appendix H of https://arxiv.org/abs/2208.04933 for a detailed review of this
+        associative scan for linear recurrent systems.
+        """
+        Ai, Bxi = ei
+        Aj, Bxj = ej
+        return Ai * Aj, Aj * Bxi + Bxj
 
-        h_: Float[Array, "d_in n"] = jax.lax.cond(
-            reset,
-            lambda _: jnp.zeros_like(h),
-            lambda _: dAi * h + dBi * xi[:, None],
-            None,
-        )
-        y: Float[Array, "d_in"] = h_ @ Ci
+    dBx: Float[Array, "l d n"] = dB * x[:, :, None]
+    A_, B_ = jax.lax.associative_scan(binop, (dA, dBx), reverse=reverse)
 
-        return h_, y
-
-    h0 = jnp.zeros(shape=(d_in, n), dtype=x.dtype)
-    _, y = jax.lax.scan(f, h0, (x, dA, dB, C, resets), reverse=reverse)
+    h: Float[Array, "l d n"] = A_ + B_
+    y = einops.einsum(h, C, "l d n, l n -> l d")
     return y + x * D
+
